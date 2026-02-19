@@ -1,18 +1,17 @@
-# wyoming_xtts/engine.py
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
-from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
 from TTS.tts.models.xtts import Xtts
 from wyoming.audio import AudioChunk
 
@@ -24,8 +23,9 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# XTTS audio output format
 SAMPLE_RATE = 24000
-SAMPLE_WIDTH = 2
+SAMPLE_WIDTH = 2  # 16-bit
 CHANNELS = 1
 
 
@@ -37,206 +37,218 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _enable_mandal_patch() -> None:
-    """
-    Token-fix du har brukt i lokaltest:
-    - rydder whitespace
-    - prepender [es]
-    - erstatter spaces med [SPACE]
-    """
-    original_encode = VoiceBpeTokenizer.encode
+def _clean_text(text: str) -> str:
+    # Tilsvarer “normalize whitespace” du gjorde i testscriptet
+    return " ".join(text.replace("\n", " ").strip().split())
 
-    def encode_norsk_fix(self, txt, lang):
-        # Vi patcher for både "no" og "es" (avhengig av hva caller sender)
-        if lang in ("no", "es"):
-            txt = txt.replace("\n", " ").strip()
-            txt = " ".join(txt.split())
-            txt = f"[es]{txt}"
-            txt = txt.replace(" ", "[SPACE]")
-            return self.tokenizer.encode(txt).ids
-        return original_encode(self, txt, lang)
 
-    VoiceBpeTokenizer.encode = encode_norsk_fix
+def _filter_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Beskytter oss mot API-endringer mellom coqui-tts versjoner:
+    Vi sender bare kwargs som faktisk finnes i signaturen.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kwargs
+    params = sig.parameters
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 class XTTSEngine:
-    """
-    Engine som passer __main__.py i repoet ditt:
-    - __main__ importerer XTTSEngine, set_seed
-    - __main__ kaller engine.load()
-    - handler streamer PCM AudioChunk-events
-    """
-
     def __init__(
         self,
         model_path: Path,
         use_deepspeed: bool = False,
-        device: Optional[str] = None,
-        seed: Optional[int] = None,
+        device: str | None = None,
+        seed: int | None = None,
+        settings: Settings | None = None,
     ) -> None:
-        self.model_path = Path(model_path)
+        self.model_path = model_path
         self.use_deepspeed = use_deepspeed
+        self.settings = settings or Settings()
+
+        # seed kan komme fra CLI eller env; CLI vinner hvis gitt
+        self.seed = seed if seed is not None else self.settings.seed
+
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Les settings fra env (både XTTS_* og WYOMING_XTTS_* via config.py)
-        self.settings = Settings()
-
-        # Seed: prioriter ctor seed (fra __main__), ellers env seed
-        self.seed: Optional[int] = seed if seed is not None else self.settings.seed
-
-        self.model: Optional[Xtts] = None
-
-        # cache conditioning latents per voice fil
-        self._cached_voice: Optional[Path] = None
-        self._cached_latents: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-
+        self.model: Xtts | None = None
         self._lock = asyncio.Lock()
 
-        if self.settings.mandal_patch:
-            _enable_mandal_patch()
+        # cache conditioning latents pr voice
+        self._cached_voice: Path | None = None
+        self._cached_latents: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        if not torch.cuda.is_available():
+            _LOGGER.warning("CUDA is not available. Har du faktisk GPU i pod’en?")
+
+    def _resolve_checkpoint_path(self) -> Path | None:
+        ckpt = (self.settings.checkpoint or "").strip()
+        if not ckpt:
+            return None
+
+        # støtt både relativt navn og full path
+        p = Path(ckpt)
+        if p.is_absolute():
+            return p
+        return self.model_path / ckpt
 
     async def load(self) -> None:
-        """
-        Laster XTTS-modellen. Kalles en gang ved oppstart.
-        """
+        _LOGGER.info(
+            "Loading XTTS from %s (device=%s, deepspeed=%s)",
+            self.model_path,
+            self.device,
+            self.use_deepspeed,
+        )
+
         config_path = self.model_path / "config.json"
         vocab_path = self.model_path / "vocab.json"
 
         if not config_path.exists():
-            raise FileNotFoundError(f"Missing config.json at {config_path}")
+            raise FileNotFoundError(f"XTTS config not found: {config_path}")
         if not vocab_path.exists():
-            raise FileNotFoundError(f"Missing vocab.json at {vocab_path}")
+            raise FileNotFoundError(f"XTTS vocab not found: {vocab_path}")
+
+        # Stabil init (samme idé som testscriptet ditt: seed før init/load)
+        set_seed(42)
 
         config = XttsConfig()
         config.load_json(str(config_path))
 
-        # Sett gpt_cond_len i config for stabilitet (særlig om synth/stream overstyrer)
-        try:
-            config.gpt_cond_len = int(self.settings.gpt_cond_len)
-        except Exception:
-            pass
+        # (Valgfritt) sett inference defaults i config også (vi sender uansett eksplisitt)
+        config.temperature = float(self.settings.temperature)
+        config.top_p = float(self.settings.top_p)
+        config.top_k = int(self.settings.top_k)
+        config.repetition_penalty = float(self.settings.repetition_penalty)
+        config.length_penalty = float(self.settings.length_penalty)
 
         self.model = Xtts.init_from_config(config)
 
-        checkpoint_path: Optional[str] = None
-        if self.settings.checkpoint:
-            cp = self.model_path / self.settings.checkpoint
-            checkpoint_path = str(cp)
+        checkpoint_path = self._resolve_checkpoint_path()
+        if checkpoint_path is not None and not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        _LOGGER.info(
-            "Loading model (device=%s deepspeed=%s) checkpoint=%s mode=%s gpt_cond_len=%s lang=%s",
-            self.device,
-            self.use_deepspeed,
-            checkpoint_path or "DEFAULT(model.pth)",
-            self.settings.inference_mode,
-            self.settings.gpt_cond_len,
-            self.settings.force_language,
-        )
-
-        self.model.load_checkpoint(
-            config,
-            checkpoint_path=checkpoint_path,  # None => default (model.pth)
+        kwargs: dict[str, Any] = dict(
             checkpoint_dir=str(self.model_path),
             vocab_path=str(vocab_path),
             use_deepspeed=self.use_deepspeed,
         )
+        if checkpoint_path is not None:
+            kwargs["checkpoint_path"] = str(checkpoint_path)
 
-        # CUDA on/off
-        if self.settings.use_cuda and torch.cuda.is_available():
-            self.model.to("cuda")
-            self.device = "cuda"
-        else:
-            self.model.to("cpu")
-            self.device = "cpu"
+        _LOGGER.info("load_checkpoint kwargs=%s", {k: v for k, v in kwargs.items() if "path" in k or k == "checkpoint_dir"})
+        self.model.load_checkpoint(config, **kwargs)
+        self.model.to(self.device)
+        self.model.eval()
 
-        _LOGGER.info("Model loaded OK on %s", self.device)
+        _LOGGER.info(
+            "Model loaded. mode=%s force_language=%s gpt_cond_len=%s seed=%s checkpoint=%s",
+            self.settings.inference_mode,
+            self.settings.force_language,
+            self.settings.gpt_cond_len,
+            self.seed,
+            checkpoint_path.name if checkpoint_path else "model.pth",
+        )
 
     def _compute_latents(self, voice_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.model is None:
-            raise RuntimeError("Model not loaded")
         if not voice_path.exists():
             raise FileNotFoundError(f"Voice file not found: {voice_path}")
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
 
-        # Coqui XTTS conditioning latents
-        gpt_cond_latent, speaker_embedding = self.model.get_conditioning_latents(
-            audio_path=[str(voice_path)]
+        lat_kwargs = dict(
+            audio_path=[str(voice_path)],
+            gpt_cond_len=int(self.settings.gpt_cond_len),
+            gpt_cond_chunk_len=int(self.settings.gpt_cond_chunk_len),
+            max_ref_length=int(self.settings.max_ref_len),
+            sound_norm_refs=bool(self.settings.sound_norm_refs),
         )
-        return gpt_cond_latent, speaker_embedding
+        lat_kwargs = _filter_kwargs(self.model.get_conditioning_latents, lat_kwargs)
+
+        _LOGGER.debug("Computing latents voice=%s kwargs=%s", voice_path.name, lat_kwargs)
+        result: tuple[torch.Tensor, torch.Tensor] = self.model.get_conditioning_latents(**lat_kwargs)
+        return result
 
     async def _get_conditioning_latents(self, voice_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Cache conditioning latents per voice file for speed.
-        """
-        if self._cached_voice != voice_path or self._cached_latents is None:
+        if self._cached_voice != voice_path:
             latents = await asyncio.to_thread(self._compute_latents, voice_path)
             self._cached_voice = voice_path
             self._cached_latents = latents
 
+        assert self._cached_latents is not None
         gpt_cond_latent, speaker_embedding = self._cached_latents
         return gpt_cond_latent.clone(), speaker_embedding.clone()
 
-    async def _synthesize_full_pcm(self, text: str, voice_path: Path) -> bytes:
-        """
-        Full inference (ofte minst babling), returnerer PCM bytes.
-        """
+    def _pick_language(self, requested: str) -> str:
+        forced = (self.settings.force_language or "").strip().lower()
+        if forced:
+            return forced
+        return (requested or "en").strip().lower()
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        voice_path: Path,
+        language: str,
+    ) -> AsyncGenerator[bytes, None]:
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
-        if self.seed is not None:
-            set_seed(int(self.seed))
+        text = _clean_text(text)
+        lang = self._pick_language(language)
 
-        gpt_cond_latent, speaker_embedding = await self._get_conditioning_latents(voice_path)
+        async with self._lock:
+            # Viktig: seed rett før inference (slik du gjorde i testscriptet)
+            if self.seed is not None:
+                set_seed(int(self.seed))
 
-        lang = (self.settings.force_language or "es").lower()
+            gpt_cond_latent, speaker_embedding = await self._get_conditioning_latents(voice_path)
 
-        with torch.no_grad():
-            out = self.model.full_inference(
-                text=text,
-                language=lang,
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
+            # felles kwargs til inference
+            infer_kwargs: dict[str, Any] = dict(
                 temperature=float(self.settings.temperature),
                 top_k=int(self.settings.top_k),
                 top_p=float(self.settings.top_p),
                 repetition_penalty=float(self.settings.repetition_penalty),
                 length_penalty=float(self.settings.length_penalty),
                 speed=float(self.settings.speed),
-                gpt_cond_len=int(self.settings.gpt_cond_len),
-            )
-        wav = torch.tensor(out["wav"])
-        return tensor_to_pcm(wav)
-
-    async def _synthesize_stream_pcm(self, text: str, voice_path: Path) -> AsyncGenerator[bytes, None]:
-        """
-        Streaming inference, returnerer PCM bytes i chunks.
-        """
-        if self.model is None:
-            raise RuntimeError("Model not loaded")
-
-        if self.seed is not None:
-            set_seed(int(self.seed))
-
-        gpt_cond_latent, speaker_embedding = await self._get_conditioning_latents(voice_path)
-
-        lang = (self.settings.force_language or "es").lower()
-
-        with torch.no_grad():
-            stream = self.model.inference_stream(
-                text=text,
-                language=lang,
-                gpt_cond_latent=gpt_cond_latent,
-                speaker_embedding=speaker_embedding,
-                temperature=float(self.settings.temperature),
-                top_k=int(self.settings.top_k),
-                top_p=float(self.settings.top_p),
-                repetition_penalty=float(self.settings.repetition_penalty),
-                length_penalty=float(self.settings.length_penalty),
-                speed=float(self.settings.speed),
-                gpt_cond_len=int(self.settings.gpt_cond_len),
-                stream_chunk_size=int(self.settings.stream_chunk_size),
                 enable_text_splitting=False,
             )
 
+            mode = self.settings.inference_mode.strip().lower()
+
+            _LOGGER.debug("Synth: mode=%s lang=%s voice=%s text=%r", mode, lang, voice_path.stem, text)
+
+            if mode == "full":
+                # full: generer hele wav’en og send som én chunk (mindre babling)
+                if not hasattr(self.model, "inference"):
+                    # fallback
+                    out = self.model.full_inference(text, [str(voice_path)], lang, **infer_kwargs)  # type: ignore[attr-defined]
+                    wav = out["wav"]
+                else:
+                    fn = self.model.inference  # type: ignore[assignment]
+                    k = _filter_kwargs(fn, infer_kwargs)
+                    out = fn(text, lang, gpt_cond_latent, speaker_embedding, **k)
+                    wav = out["wav"]
+
+                wav_tensor = torch.tensor(wav, dtype=torch.float32)
+                yield tensor_to_pcm(wav_tensor)
+                return
+
+            # stream: inference_stream yields torch wav chunks
+            if not hasattr(self.model, "inference_stream"):
+                # fallback til full hvis streaming ikke finnes
+                out = self.model.inference(text, lang, gpt_cond_latent, speaker_embedding, **infer_kwargs)
+                wav_tensor = torch.tensor(out["wav"], dtype=torch.float32)
+                yield tensor_to_pcm(wav_tensor)
+                return
+
+            fn2 = self.model.inference_stream  # type: ignore[assignment]
+            stream_kwargs: dict[str, Any] = dict(infer_kwargs)
+            stream_kwargs["stream_chunk_size"] = int(self.settings.stream_chunk_size)
+            k2 = _filter_kwargs(fn2, stream_kwargs)
+
+            stream = fn2(text, lang, gpt_cond_latent, speaker_embedding, **k2)
             for chunk in stream:
                 yield tensor_to_pcm(chunk)
 
@@ -247,30 +259,16 @@ class XTTSEngine:
         voice_path: Path,
         language: str,
     ) -> float | None:
-        """
-        Wyoming handler bruker denne til å sende AudioChunk-events.
-        """
         first_audio_time: float | None = None
         start = time.perf_counter()
 
-        async with self._lock:
-            mode = (self.settings.inference_mode or "stream").lower()
-
-            if mode == "full":
-                pcm = await self._synthesize_full_pcm(text=text, voice_path=voice_path)
+        async for chunk in self.synthesize_stream(text, voice_path, language):
+            if first_audio_time is None:
                 first_audio_time = time.perf_counter() - start
-                await handler.write_event(
-                    AudioChunk(audio=pcm, rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event()
-                )
-                return first_audio_time
+                _LOGGER.debug("First audio chunk: %.3fs", first_audio_time)
 
-            async for pcm_chunk in self._synthesize_stream_pcm(text=text, voice_path=voice_path):
-                if first_audio_time is None:
-                    first_audio_time = time.perf_counter() - start
-                    _LOGGER.debug("First audio chunk: %.3fs", first_audio_time)
-
-                await handler.write_event(
-                    AudioChunk(audio=pcm_chunk, rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event()
-                )
+            await handler.write_event(
+                AudioChunk(audio=chunk, rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event()
+            )
 
         return first_audio_time
