@@ -146,8 +146,8 @@ class XTTSEngine:
                     speed=1.0,                # Hardkodet
                     top_k=50,                 # Hardkodet
                     top_p=0.85,               # Hardkodet
-                    repetition_penalty=5.0,   # Hardkodet! (Fikser babling)
-                    stream_chunk_size=400,    # Hardkodet! (Hindrer hakking)
+                    repetition_penalty=10.0,   # Hardkodet! (Fikser babling)
+                    stream_chunk_size=20,    # Hardkodet! (Hindrer hakking)
                     enable_text_splitting=False,
                 )
 
