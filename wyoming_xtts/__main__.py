@@ -133,6 +133,7 @@ async def main() -> None:
         model_path=models_path,
         use_deepspeed=args.deepspeed,
         seed=args.seed,
+        settings=settings,
     )
     await engine.load()
     _LOGGER.info("Synthesis settings: Custom Hardcoded Mandal Config | Seed=%s", args.seed)
