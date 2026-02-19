@@ -110,4 +110,108 @@ class XttsEngine:
         # eller interne defaults overstyrer.
         self.xtts_config.gpt_cond_len = int(self.cfg.gpt_cond_len)
 
-        # (valgfritt) behold også samplingparametre i conf
+        # (valgfritt) behold også samplingparametre i config for konsistens
+        # (disse overstyres også per kall under)
+        self.xtts_config.temperature = float(self.cfg.temperature)
+        self.xtts_config.top_p = float(self.cfg.top_p)
+        self.xtts_config.top_k = int(self.cfg.top_k)
+        self.xtts_config.repetition_penalty = float(self.cfg.repetition_penalty)
+        self.xtts_config.length_penalty = float(self.cfg.length_penalty)
+
+        # Init model
+        self.model = Xtts.init_from_config(self.xtts_config)
+        self.model.load_checkpoint(
+            self.xtts_config,
+            checkpoint_path=checkpoint_path,     # <-- Tving valgt checkpoint!
+            vocab_path=vocab_path,
+            checkpoint_dir=self.cfg.model_dir,
+            use_deepspeed=False,
+        )
+
+        if self.cfg.use_cuda and torch.cuda.is_available():
+            self.model.cuda()
+
+        self.sample_rate = 24000  # XTTS typisk
+
+    def _prepare_seed(self) -> None:
+        if self.cfg.seed and self.cfg.seed > 0:
+            set_seed(self.cfg.seed)
+
+    def synthesize(
+        self,
+        text: str,
+        speaker_wav: str,
+        language: Optional[str] = None,
+    ) -> np.ndarray:
+        """
+        Non-streaming: ofte mindre babling enn stream-path.
+        """
+        self._prepare_seed()
+
+        lang = (language or self.cfg.force_language or "es").strip().lower()
+
+        # Bruk full_inference for å få gpt_cond_len eksplisitt og stabilt.
+        out = self.model.full_inference(
+            text=text,
+            language=lang,
+            speaker_wav=speaker_wav,
+            temperature=float(self.cfg.temperature),
+            top_p=float(self.cfg.top_p),
+            top_k=int(self.cfg.top_k),
+            repetition_penalty=float(self.cfg.repetition_penalty),
+            length_penalty=float(self.cfg.length_penalty),
+            speed=float(self.cfg.speed),
+            gpt_cond_len=int(self.cfg.gpt_cond_len),
+        )
+
+        wav = out["wav"]
+        # out["wav"] kan være list/np.ndarray; standardiser til np.ndarray float32
+        return np.asarray(wav, dtype=np.float32)
+
+    def synthesize_stream(
+        self,
+        text: str,
+        speaker_wav: str,
+        language: Optional[str] = None,
+    ) -> Iterator[np.ndarray]:
+        """
+        Streaming: kan være litt mer “utsatt” for babling for enkelte finetunes,
+        men er nyttig for responsivitet. Chunk-size kan hjelpe.
+        """
+        self._prepare_seed()
+
+        lang = (language or self.cfg.force_language or "es").strip().lower()
+
+        # inference_stream gir en generator av wav-chunks
+        stream = self.model.inference_stream(
+            text=text,
+            language=lang,
+            speaker_wav=speaker_wav,
+            stream_chunk_size=int(self.cfg.stream_chunk_size),
+            temperature=float(self.cfg.temperature),
+            top_p=float(self.cfg.top_p),
+            top_k=int(self.cfg.top_k),
+            repetition_penalty=float(self.cfg.repetition_penalty),
+            length_penalty=float(self.cfg.length_penalty),
+            speed=float(self.cfg.speed),
+            gpt_cond_len=int(self.cfg.gpt_cond_len),
+        )
+
+        for chunk in stream:
+            yield np.asarray(chunk, dtype=np.float32)
+
+    def infer(
+        self,
+        text: str,
+        speaker_wav: str,
+        language: Optional[str] = None,
+    ) -> Iterator[np.ndarray] | np.ndarray:
+        """
+        Velg inference-mode via env:
+          WYOMING_XTTS_INFERENCE_MODE=full  -> returnerer full wav (np.ndarray)
+          WYOMING_XTTS_INFERENCE_MODE=stream -> returnerer iterator med chunks
+        """
+        mode = (self.cfg.inference_mode or "stream").strip().lower()
+        if mode == "full":
+            return self.synthesize(text=text, speaker_wav=speaker_wav, language=language)
+        return self.synthesize_stream(text=text, speaker_wav=speaker_wav, language=language)
