@@ -32,45 +32,58 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_str(name: str, default: str) -> str:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    v = val.strip()
+    return v if v else default
+
+
 @dataclass
-class XttsRuntimeConfig:
-    # Hvor ligger modellen (samme som før)
-    model_dir: str = os.getenv("WYOMING_XTTS_MODEL_DIR", "model_cache")
+class Settings:
+    """
+    Bakoverkompatibel Settings for __main__.py.
 
-    # HuggingFace repo hvis du laster assets fra HF (valgfritt i engine)
-    hf_repo_id: str = os.getenv("WYOMING_XTTS_HF_REPO_ID", "telvenes/xtts-mandal")
+    Nye felter (WYOMING_XTTS_*) brukes av den oppdaterte engine-koden.
+    Gamle (XTTS_*) beholdes som kompatibilitet der det er naturlig.
+    """
 
-    # Tving spesifikk checkpoint-fil (VIKTIG!)
-    # Eks: checkpoint_14000.pth
-    checkpoint_filename: str | None = os.getenv("WYOMING_XTTS_CHECKPOINT", "").strip() or None
+    # --- Eksisterende "wyoming-xtts" settings (hold disse hvis resten av koden bruker dem) ---
+    log_level: str = _get_str("XTTS_LOG_LEVEL", "INFO")
+    zeroconf_name: str = _get_str("XTTS_ZEROCONF", "wyoming-xtts")
 
-    # Language: tving språk (ofte "es" hvis du bruker [es]-anker)
-    force_language: str = os.getenv("WYOMING_XTTS_LANGUAGE", "es").strip() or "es"
+    # Noen images bruker dette til å styre om den skal hente modell automatisk
+    no_download_model: bool = _get_bool("XTTS_NO_DOWNLOAD_MODEL", False)
 
-    # Token patch: slå på/av mandal patch
+    # Deepspeed flag (hvis koden din faktisk bruker dette)
+    deepspeed: bool = _get_bool("XTTS_DEEPSPEED", False)
+
+    # --- NYE anbefalte runtime settings ---
+    model_dir: str = _get_str("WYOMING_XTTS_MODEL_DIR", "/data/model_cache")
+    hf_repo_id: str = _get_str("WYOMING_XTTS_HF_REPO_ID", "telvenes/xtts-mandal")
+
+    checkpoint_filename: str | None = (
+        os.getenv("WYOMING_XTTS_CHECKPOINT", "").strip() or None
+    )
+
+    force_language: str = _get_str("WYOMING_XTTS_LANGUAGE", "es").lower()
     enable_mandal_patch: bool = _get_bool("WYOMING_XTTS_MANDAL_PATCH", True)
 
-    # Inference: "stream" (som nå) eller "full" (ofte mindre babling)
-    inference_mode: str = os.getenv("WYOMING_XTTS_INFERENCE_MODE", "stream").strip().lower()
-    # Stream chunk size (brukes kun ved stream)
+    inference_mode: str = _get_str("WYOMING_XTTS_INFERENCE_MODE", "stream").lower()
     stream_chunk_size: int = _get_int("WYOMING_XTTS_STREAM_CHUNK_SIZE", 400)
 
-    # Sampling / decoding params (disse påvirker babling ekstremt mye)
     temperature: float = _get_float("WYOMING_XTTS_TEMPERATURE", 0.75)
     top_p: float = _get_float("WYOMING_XTTS_TOP_P", 0.85)
     top_k: int = _get_int("WYOMING_XTTS_TOP_K", 50)
     repetition_penalty: float = _get_float("WYOMING_XTTS_REPETITION_PENALTY", 5.0)
     length_penalty: float = _get_float("WYOMING_XTTS_LENGTH_PENALTY", 1.0)
 
-    # Denne er ofte en stor forskjell mellom “babling” og “stabil”
-    # Default i XTTS er ofte høyere; du testet 3 i lokaltest
     gpt_cond_len: int = _get_int("WYOMING_XTTS_GPT_COND_LEN", 3)
-
-    # Tempo / speed
     speed: float = _get_float("WYOMING_XTTS_SPEED", 1.0)
 
-    # Determinisme: seed (0/blank = tilfeldig)
     seed: int = _get_int("WYOMING_XTTS_SEED", 0)
-
-    # GPU
     use_cuda: bool = _get_bool("WYOMING_XTTS_CUDA", True)
+
+    # (Valgfritt) Eksponer port hvis koden din leser det
+    port: int = _get_int("WYOMING_XTTS_PORT", 10200)
