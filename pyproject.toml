@@ -14,7 +14,7 @@ dependencies = [
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "wyoming[zeroconf]>=1.8.0",
-    "coqui-tts==0.24.3",
+    "coqui-tts==0.27.5",
     "deepspeed==0.17.2",
     "langdetect>=1.0.9",
     "sentence-stream>=1.2.0",
