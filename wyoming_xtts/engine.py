@@ -1,25 +1,32 @@
 # wyoming_xtts/engine.py
-from __future__ import annotations
-
-import os
+import asyncio
+import logging
 import random
-from typing import Iterator, Optional
+import time
+from collections.abc import AsyncGenerator
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-
-from huggingface_hub import hf_hub_download
-
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
+from wyoming.audio import AudioChunk
 
-from .config import XttsRuntimeConfig
+from .audio import tensor_to_pcm
+from .config import Settings  # <-- bruk Settings (men config.py eksporterer også XttsRuntimeConfig)
+
+if TYPE_CHECKING:
+    from wyoming.server import AsyncEventHandler
+
+_LOGGER = logging.getLogger(__name__)
+
+SAMPLE_RATE = 24000
+SAMPLE_WIDTH = 2
+CHANNELS = 1
 
 
-# --------------------------
-# Utils
-# --------------------------
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -28,190 +35,111 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _maybe_enable_mandal_patch(enable: bool) -> None:
-    """
-    Mandal patch: gjør whitespace deterministisk og bruker [es] + [SPACE].
-    Dette er et "anker" som kan stabilisere en finetune som egentlig ikke støtter "no".
-    """
-    if not enable:
-        return
-
+def _enable_mandal_patch() -> None:
     original_encode = VoiceBpeTokenizer.encode
 
-    def encode_mandal_fix(self, txt, lang):
-        # Patch kun når vi ber om norsk (no) eller når serveren tvinger es som språkanker.
-        # Dette er litt defensivt: fungerer både hvis caller sender "no" eller "es".
-        if lang in ("no", "es"):
-            txt = txt.replace("\n", " ").strip()
-            txt = " ".join(txt.split())
-            txt = f"[es]{txt}"
-            txt = txt.replace(" ", "[SPACE]")
-            return self.tokenizer.encode(txt).ids
-        return original_encode(self, txt, lang)
+    def encode_norsk_fix(self, txt, lang):
+        txt = txt.replace("\n", " ").strip()
+        txt = " ".join(txt.split())
+        txt = f"[es]{txt}"
+        txt = txt.replace(" ", "[SPACE]")
+        return self.tokenizer.encode(txt).ids
 
-    VoiceBpeTokenizer.encode = encode_mandal_fix
+    VoiceBpeTokenizer.encode = encode_norsk_fix
 
 
-def _ensure_model_assets(cfg: XttsRuntimeConfig) -> tuple[str, str, str]:
-    """
-    Sørger for at config.json og vocab.json finnes i model_dir.
-    Returnerer (config_path, vocab_path, checkpoint_path)
-    """
-    os.makedirs(cfg.model_dir, exist_ok=True)
+class XTTSEngine:
+    def __init__(
+        self,
+        model_path: Path,
+        use_deepspeed: bool = False,
+        device: str | None = None,
+        seed: int | None = None,
+    ):
+        self.model_path = model_path
+        self.seed = seed
+        self.use_deepspeed = use_deepspeed
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    config_path = os.path.join(cfg.model_dir, "config.json")
-    vocab_path = os.path.join(cfg.model_dir, "vocab.json")
+        self.settings = Settings()  # <-- les env her
 
-    # Last ned config/vocab hvis de mangler
-    for filename, local in [("config.json", config_path), ("vocab.json", vocab_path)]:
-        if not os.path.exists(local):
-            hf_hub_download(repo_id=cfg.hf_repo_id, filename=filename, local_dir=cfg.model_dir)
+        self.model: Xtts | None = None
+        self._lock = asyncio.Lock()
+        self._cached_voice: Path | None = None
+        self._cached_latents: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    # Finn checkpoint
-    if cfg.checkpoint_filename:
-        ckpt_path = os.path.join(cfg.model_dir, cfg.checkpoint_filename)
-        if not os.path.exists(ckpt_path):
-            hf_hub_download(repo_id=cfg.hf_repo_id, filename=cfg.checkpoint_filename, local_dir=cfg.model_dir)
-        return config_path, vocab_path, ckpt_path
+        if not torch.cuda.is_available():
+            _LOGGER.warning("CUDA is not available. Har du passert GPU inn i containeren?")
 
-    # Hvis ikke spesifisert: fall tilbake til model.pth hvis den finnes,
-    # ellers prøv å hente model.pth fra HF.
-    ckpt_path = os.path.join(cfg.model_dir, "model.pth")
-    if not os.path.exists(ckpt_path):
-        hf_hub_download(repo_id=cfg.hf_repo_id, filename="model.pth", local_dir=cfg.model_dir)
+        if self.settings.mandal_patch:
+            _enable_mandal_patch()
 
-    return config_path, vocab_path, ckpt_path
+        # Hvis env seed er satt i Settings og __main__ også sender seed:
+        # prioriter __main__/CLI seed (som før), ellers settings.seed.
+        if self.seed is None:
+            self.seed = self.settings.seed
 
+    async def load(self) -> None:
+        _LOGGER.info(
+            "Loading XTTS model from %s (device=%s, deepspeed=%s)",
+            self.model_path,
+            self.device,
+            self.use_deepspeed,
+        )
 
-# --------------------------
-# Engine
-# --------------------------
-class XttsEngine:
-    def __init__(self, runtime_cfg: Optional[XttsRuntimeConfig] = None) -> None:
-        self.cfg = runtime_cfg or XttsRuntimeConfig()
+        config_path = self.model_path / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"XTTS config not found: {config_path}")
 
-        # Mandal patch (tokenisering)
-        _maybe_enable_mandal_patch(self.cfg.enable_mandal_patch)
+        config = XttsConfig()
+        config.load_json(str(config_path))
 
-        # Seed: bruk en "load-seed" for konsistent init, men en egen seed før inference
-        if self.cfg.seed:
-            set_seed(self.cfg.seed)
-        else:
-            set_seed(42)
+        # Sett gpt_cond_len i config for mer stabilt resultat
+        try:
+            config.gpt_cond_len = int(self.settings.gpt_cond_len)
+        except Exception:
+            pass
 
-        # Last assets
-        config_path, vocab_path, checkpoint_path = _ensure_model_assets(self.cfg)
+        self.model = Xtts.init_from_config(config)
 
-        # Last XTTS config
-        self.xtts_config = XttsConfig()
-        self.xtts_config.load_json(config_path)
+        # checkpoint: hvis satt, tving checkpoint_path. Ellers default oppførsel (model.pth i dir).
+        checkpoint_path = None
+        if self.settings.checkpoint:
+            cp = self.model_path / self.settings.checkpoint
+            checkpoint_path = str(cp)
 
-        # SUPER VIKTIG: sett config-gpt_cond_len her for å unngå at "synthesize"
-        # eller interne defaults overstyrer.
-        self.xtts_config.gpt_cond_len = int(self.cfg.gpt_cond_len)
-
-        # (valgfritt) behold også samplingparametre i config for konsistens
-        # (disse overstyres også per kall under)
-        self.xtts_config.temperature = float(self.cfg.temperature)
-        self.xtts_config.top_p = float(self.cfg.top_p)
-        self.xtts_config.top_k = int(self.cfg.top_k)
-        self.xtts_config.repetition_penalty = float(self.cfg.repetition_penalty)
-        self.xtts_config.length_penalty = float(self.cfg.length_penalty)
-
-        # Init model
-        self.model = Xtts.init_from_config(self.xtts_config)
         self.model.load_checkpoint(
-            self.xtts_config,
-            checkpoint_path=checkpoint_path,     # <-- Tving valgt checkpoint!
-            vocab_path=vocab_path,
-            checkpoint_dir=self.cfg.model_dir,
-            use_deepspeed=False,
+            config,
+            checkpoint_path=checkpoint_path,  # None = default
+            checkpoint_dir=str(self.model_path),
+            vocab_path=str(self.model_path / "vocab.json"),
+            use_deepspeed=self.use_deepspeed,
         )
 
-        if self.cfg.use_cuda and torch.cuda.is_available():
-            self.model.cuda()
+        # CUDA on/off
+        if self.settings.use_cuda and torch.cuda.is_available():
+            self.model.to("cuda")
+            self.device = "cuda"
+        else:
+            self.model.to("cpu")
+            self.device = "cpu"
 
-        self.sample_rate = 24000  # XTTS typisk
-
-    def _prepare_seed(self) -> None:
-        if self.cfg.seed and self.cfg.seed > 0:
-            set_seed(self.cfg.seed)
-
-    def synthesize(
-        self,
-        text: str,
-        speaker_wav: str,
-        language: Optional[str] = None,
-    ) -> np.ndarray:
-        """
-        Non-streaming: ofte mindre babling enn stream-path.
-        """
-        self._prepare_seed()
-
-        lang = (language or self.cfg.force_language or "es").strip().lower()
-
-        # Bruk full_inference for å få gpt_cond_len eksplisitt og stabilt.
-        out = self.model.full_inference(
-            text=text,
-            language=lang,
-            speaker_wav=speaker_wav,
-            temperature=float(self.cfg.temperature),
-            top_p=float(self.cfg.top_p),
-            top_k=int(self.cfg.top_k),
-            repetition_penalty=float(self.cfg.repetition_penalty),
-            length_penalty=float(self.cfg.length_penalty),
-            speed=float(self.cfg.speed),
-            gpt_cond_len=int(self.cfg.gpt_cond_len),
+        _LOGGER.info(
+            "Model loaded. mode=%s lang=%s gpt_cond_len=%s",
+            self.settings.inference_mode,
+            self.settings.force_language,
+            self.settings.gpt_cond_len,
         )
 
-        wav = out["wav"]
-        # out["wav"] kan være list/np.ndarray; standardiser til np.ndarray float32
-        return np.asarray(wav, dtype=np.float32)
+    def _compute_latents(self, voice_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
+        if not voice_path.exists():
+            raise FileNotFoundError(f"Voice file not found: {voice_path}")
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
 
-    def synthesize_stream(
-        self,
-        text: str,
-        speaker_wav: str,
-        language: Optional[str] = None,
-    ) -> Iterator[np.ndarray]:
-        """
-        Streaming: kan være litt mer “utsatt” for babling for enkelte finetunes,
-        men er nyttig for responsivitet. Chunk-size kan hjelpe.
-        """
-        self._prepare_seed()
-
-        lang = (language or self.cfg.force_language or "es").strip().lower()
-
-        # inference_stream gir en generator av wav-chunks
-        stream = self.model.inference_stream(
-            text=text,
-            language=lang,
-            speaker_wav=speaker_wav,
-            stream_chunk_size=int(self.cfg.stream_chunk_size),
-            temperature=float(self.cfg.temperature),
-            top_p=float(self.cfg.top_p),
-            top_k=int(self.cfg.top_k),
-            repetition_penalty=float(self.cfg.repetition_penalty),
-            length_penalty=float(self.cfg.length_penalty),
-            speed=float(self.cfg.speed),
-            gpt_cond_len=int(self.cfg.gpt_cond_len),
+        result: tuple[torch.Tensor, torch.Tensor] = self.model.get_conditioning_latents(
+            audio_path=[str(voice_path)]
         )
+        return result
 
-        for chunk in stream:
-            yield np.asarray(chunk, dtype=np.float32)
-
-    def infer(
-        self,
-        text: str,
-        speaker_wav: str,
-        language: Optional[str] = None,
-    ) -> Iterator[np.ndarray] | np.ndarray:
-        """
-        Velg inference-mode via env:
-          WYOMING_XTTS_INFERENCE_MODE=full  -> returnerer full wav (np.ndarray)
-          WYOMING_XTTS_INFERENCE_MODE=stream -> returnerer iterator med chunks
-        """
-        mode = (self.cfg.inference_mode or "stream").strip().lower()
-        if mode == "full":
-            return self.synthesize(text=text, speaker_wav=speaker_wav, language=language)
-        return self.synthesize_stream(text=text, speaker_wav=speaker_wav, language=language)
+    async def _get_conditioning_latents(self, voice_path: Path) -> tupl
