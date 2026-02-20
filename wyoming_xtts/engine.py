@@ -38,7 +38,7 @@ def set_seed(seed: int) -> None:
 
 
 def _clean_text(text: str) -> str:
-    # Tilsvarer “normalize whitespace” du gjorde i testscriptet
+    # normalize whitespace
     return " ".join(text.replace("\n", " ").strip().split())
 
 
@@ -109,13 +109,13 @@ class XTTSEngine:
         if not vocab_path.exists():
             raise FileNotFoundError(f"XTTS vocab not found: {vocab_path}")
 
-        # Stabil init (samme idé som testscriptet ditt: seed før init/load)
+        # Stabil init
         set_seed(42)
 
         config = XttsConfig()
         config.load_json(str(config_path))
 
-        # (Valgfritt) sett inference defaults i config også (vi sender uansett eksplisitt)
+        # default inference knobs (vi sender uansett eksplisitt under)
         config.temperature = float(self.settings.temperature)
         config.top_p = float(self.settings.top_p)
         config.top_k = int(self.settings.top_k)
@@ -136,7 +136,10 @@ class XTTSEngine:
         if checkpoint_path is not None:
             kwargs["checkpoint_path"] = str(checkpoint_path)
 
-        _LOGGER.info("load_checkpoint kwargs=%s", {k: v for k, v in kwargs.items() if "path" in k or k == "checkpoint_dir"})
+        _LOGGER.info(
+            "load_checkpoint kwargs=%s",
+            {k: v for k, v in kwargs.items() if "path" in k or k == "checkpoint_dir"},
+        )
         self.model.load_checkpoint(config, **kwargs)
         self.model.to(self.device)
         self.model.eval()
@@ -165,110 +168,4 @@ class XTTSEngine:
         )
         lat_kwargs = _filter_kwargs(self.model.get_conditioning_latents, lat_kwargs)
 
-        _LOGGER.debug("Computing latents voice=%s kwargs=%s", voice_path.name, lat_kwargs)
-        result: tuple[torch.Tensor, torch.Tensor] = self.model.get_conditioning_latents(**lat_kwargs)
-        return result
-
-    async def _get_conditioning_latents(self, voice_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._cached_voice != voice_path:
-            latents = await asyncio.to_thread(self._compute_latents, voice_path)
-            self._cached_voice = voice_path
-            self._cached_latents = latents
-
-        assert self._cached_latents is not None
-        gpt_cond_latent, speaker_embedding = self._cached_latents
-        return gpt_cond_latent.clone(), speaker_embedding.clone()
-
-    def _pick_language(self, requested: str) -> str:
-        forced = (self.settings.force_language or "").strip().lower()
-        if forced:
-            return forced
-        return (requested or "en").strip().lower()
-
-    async def synthesize_stream(
-        self,
-        text: str,
-        voice_path: Path,
-        language: str,
-    ) -> AsyncGenerator[bytes, None]:
-        if self.model is None:
-            raise RuntimeError("Model not loaded")
-
-        text = _clean_text(text)
-        lang = self._pick_language(language)
-
-        async with self._lock:
-            # Viktig: seed rett før inference (slik du gjorde i testscriptet)
-            if self.seed is not None:
-                set_seed(int(self.seed))
-
-            gpt_cond_latent, speaker_embedding = await self._get_conditioning_latents(voice_path)
-
-            # felles kwargs til inference
-            infer_kwargs: dict[str, Any] = dict(
-                temperature=float(self.settings.temperature),
-                top_k=int(self.settings.top_k),
-                top_p=float(self.settings.top_p),
-                repetition_penalty=float(self.settings.repetition_penalty),
-                length_penalty=float(self.settings.length_penalty),
-                speed=float(self.settings.speed),
-                enable_text_splitting=False,
-            )
-
-            mode = self.settings.inference_mode.strip().lower()
-
-            _LOGGER.debug("Synth: mode=%s lang=%s voice=%s text=%r", mode, lang, voice_path.stem, text)
-
-            if mode == "full":
-                # full: generer hele wav’en og send som én chunk (mindre babling)
-                if not hasattr(self.model, "inference"):
-                    # fallback
-                    out = self.model.full_inference(text, [str(voice_path)], lang, **infer_kwargs)  # type: ignore[attr-defined]
-                    wav = out["wav"]
-                else:
-                    fn = self.model.inference  # type: ignore[assignment]
-                    k = _filter_kwargs(fn, infer_kwargs)
-                    out = fn(text, lang, gpt_cond_latent, speaker_embedding, **k)
-                    wav = out["wav"]
-
-                wav_tensor = torch.tensor(wav, dtype=torch.float32)
-                yield tensor_to_pcm(wav_tensor)
-                return
-
-            # stream: inference_stream yields torch wav chunks
-            if not hasattr(self.model, "inference_stream"):
-                # fallback til full hvis streaming ikke finnes
-                out = self.model.inference(text, lang, gpt_cond_latent, speaker_embedding, **infer_kwargs)
-                wav_tensor = torch.tensor(out["wav"], dtype=torch.float32)
-                yield tensor_to_pcm(wav_tensor)
-                return
-
-            fn2 = self.model.inference_stream  # type: ignore[assignment]
-            stream_kwargs: dict[str, Any] = dict(infer_kwargs)
-            stream_kwargs["stream_chunk_size"] = int(self.settings.stream_chunk_size)
-            k2 = _filter_kwargs(fn2, stream_kwargs)
-
-            stream = fn2(text, lang, gpt_cond_latent, speaker_embedding, **k2)
-            for chunk in stream:
-                yield tensor_to_pcm(chunk)
-
-    async def stream_to_handler(
-        self,
-        handler: "AsyncEventHandler",
-        text: str,
-        voice_path: Path,
-        language: str,
-    ) -> float | None:
-        first_audio_time: float | None = None
-        start = time.perf_counter()
-
-        async for chunk in self.synthesize_stream(text, voice_path, language):
-            if first_audio_time is None:
-                first_audio_time = time.perf_counter() - start
-                _LOGGER.debug("First audio chunk: %.3fs", first_audio_time)
-
-            await handler.write_event(
-                AudioChunk(audio=chunk, rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event()
-            )
-
-        return first_audio_time
+        _LOGGER._
