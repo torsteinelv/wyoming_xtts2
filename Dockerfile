@@ -1,5 +1,5 @@
 # CUDA variant: cu126 (Pascal-Ada) or cu128 (Volta-Blackwell)
-ARG CUDA_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu22.04
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
 ARG TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0"
 
