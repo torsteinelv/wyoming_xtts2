@@ -12,7 +12,7 @@ dependencies = [
     # PyTorch - install with: --extra-index-url https://download.pytorch.org/whl/cu126
     # cu126 has sm_60 which covers Pascal GPUs (GTX 1080/1080 Ti)
     "torch==2.7.1",
-    "torchaudio==2.7.1",
+    "torchaudio==2.10.0",
     "wyoming[zeroconf]>=1.8.0",
     "coqui-tts==0.24.3",
     "deepspeed==0.17.2",
